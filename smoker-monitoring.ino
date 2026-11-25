@@ -10,13 +10,19 @@
 // PIN CONFIGURATION - NODEMCU ESP8266
 // =====================================================
 
-#define DS18B20_PIN D0       // GPIO16
+#define DS18B20_PIN D0
 #define MQ2_PIN A0
 
-#define LED_GREEN  D1         // GPIO5
-#define LED_YELLOW D2         // GPIO4
-#define LED_RED    D5         // GPIO14
-#define LED_BLUE   D6         // GPIO12
+// Functional LED assignments
+#define LED_SYSTEM_STATUS       D1  // GPIO5
+#define LED_CALIBRATION_STATUS  D2  // GPIO4
+#define LED_SMOKE_ALERT         D5  // GPIO14
+#define LED_SENSOR_FAULT        D6  // GPIO12
+
+// LED electrical polarity
+// Current PCB: LED lights up when GPIO is HIGH
+#define LED_ON  HIGH
+#define LED_OFF LOW
 
 // =====================================================
 // WIFI ACCESS POINT
@@ -49,11 +55,11 @@ bool mq2SensorFault = false;
 // PARAMETERS
 // =====================================================
 
-// Initial conditioning : 24 hours
+// Initial conditioning: 24 hours
 const uint64_t INITIAL_PREHEAT_MS =
   24ULL * 60ULL * 60ULL * 1000ULL;
 
-// Stabilization before calibration : 5 minutes
+// Stabilization before calibration: 5 minutes
 const unsigned long STABILIZATION_MS = 300000UL;
 
 // Calibration
@@ -74,6 +80,10 @@ const unsigned long MQ2_REFRESH_MS = 500UL;
 
 // Smoke threshold (% relative to baseline)
 const float SMOKE_ALERT_THRESHOLD = 15.0;
+
+// ADC limits used for basic fault detection
+const int MQ2_ADC_MIN_VALID = 5;
+const int MQ2_ADC_MAX_VALID = 1018;
 
 // Hotspot retry interval
 const unsigned long AP_RETRY_INTERVAL = 10000UL;
@@ -124,8 +134,8 @@ bool temperaturePending = false;
 
 unsigned long lastMQ2Read = 0;
 
-unsigned long lastGreenBlink = 0;
-bool greenLedState = false;
+unsigned long lastSystemStatusBlink = 0;
+bool systemStatusLedState = false;
 
 unsigned long stabilizationStart = 0;
 
@@ -176,8 +186,9 @@ void loadData() {
   preheatElapsed = persistentData.preheatElapsed;
   mq2Baseline = persistentData.baseline;
 
-  if (preheatElapsed > INITIAL_PREHEAT_MS)
+  if (preheatElapsed > INITIAL_PREHEAT_MS) {
     preheatElapsed = INITIAL_PREHEAT_MS;
+  }
 
   if (persistentData.conditioned ||
       preheatElapsed >= INITIAL_PREHEAT_MS) {
@@ -207,7 +218,7 @@ void updateTemperature() {
 
   unsigned long now = millis();
 
-  // Retrieve the result after conversion
+  // Retrieve result after conversion
   if (temperaturePending &&
       now - lastTempRequest >= TEMP_CONVERSION_MS) {
 
@@ -229,7 +240,7 @@ void updateTemperature() {
     temperaturePending = false;
   }
 
-  // Request the next conversion
+  // Request next conversion
   if (!temperaturePending &&
       now - lastTempRefresh >= TEMP_REFRESH_MS) {
 
@@ -244,20 +255,23 @@ void updateTemperature() {
 
 void updateMQ2() {
 
-  if (millis() - lastMQ2Read < MQ2_REFRESH_MS)
+  if (millis() - lastMQ2Read < MQ2_REFRESH_MS) {
     return;
+  }
 
   lastMQ2Read = millis();
 
   mq2Raw = analogRead(MQ2_PIN);
 
-  // Detect values close to ADC limits
+  // Basic electrical anomaly detection
   mq2SensorFault =
-    (mq2Raw <= 5 || mq2Raw >= 1018);
+    mq2Raw <= MQ2_ADC_MIN_VALID ||
+    mq2Raw >= MQ2_ADC_MAX_VALID;
 
-  // Also check the baseline during monitoring
+  // Check baseline validity during monitoring
   if (state == MONITORING &&
-      (mq2Baseline <= 5 || mq2Baseline >= 1018)) {
+      (mq2Baseline <= MQ2_ADC_MIN_VALID ||
+       mq2Baseline >= MQ2_ADC_MAX_VALID)) {
 
     mq2SensorFault = true;
   }
@@ -286,8 +300,9 @@ void updateMQ2() {
 
 void updatePreheat() {
 
-  if (state != INITIAL_PREHEAT)
+  if (state != INITIAL_PREHEAT) {
     return;
+  }
 
   unsigned long now = millis();
 
@@ -296,19 +311,16 @@ void updatePreheat() {
     return;
   }
 
-  // Cumulative powered time
+  // Cumulative powered time only
   preheatElapsed += now - lastPreheatUpdate;
-
   lastPreheatUpdate = now;
 
   if (preheatElapsed >= INITIAL_PREHEAT_MS) {
 
     preheatElapsed = INITIAL_PREHEAT_MS;
-
     state = WAIT_CALIBRATION;
 
     saveData();
-
     lastSave = now;
   }
 
@@ -327,8 +339,9 @@ void updatePreheat() {
 void startCalibration() {
 
   if (state != WAIT_CALIBRATION &&
-      state != MONITORING)
+      state != MONITORING) {
     return;
+  }
 
   state = STABILIZATION;
 
@@ -360,33 +373,56 @@ void updateCalibration() {
   }
 
   // Calibration sampling
-  if (state != CALIBRATION)
+  if (state != CALIBRATION) {
     return;
+  }
 
   unsigned long now = millis();
 
   if (now - calibrationLastSample <
-      CALIBRATION_INTERVAL)
+      CALIBRATION_INTERVAL) {
     return;
+  }
 
   calibrationLastSample = now;
 
   int sample = analogRead(MQ2_PIN);
+
+  // Reject an electrically invalid sample
+  if (sample <= MQ2_ADC_MIN_VALID ||
+      sample >= MQ2_ADC_MAX_VALID) {
+
+    mq2SensorFault = true;
+    return;
+  }
 
   calibrationSum += sample;
   calibrationCount++;
 
   if (calibrationCount >= CALIBRATION_SAMPLES) {
 
-    mq2Baseline =
+    int newBaseline =
       calibrationSum / CALIBRATION_SAMPLES;
 
-    state = MONITORING;
+    if (newBaseline > MQ2_ADC_MIN_VALID &&
+        newBaseline < MQ2_ADC_MAX_VALID) {
 
-    smokeVariation = 0.0;
-    smokeAlert = false;
+      mq2Baseline = newBaseline;
 
-    saveData();
+      state = MONITORING;
+
+      smokeVariation = 0.0;
+      smokeAlert = false;
+      mq2SensorFault = false;
+
+      saveData();
+
+    } else {
+
+      // Calibration failed: return to waiting state
+      mq2SensorFault = true;
+      state = WAIT_CALIBRATION;
+    }
   }
 }
 
@@ -427,11 +463,13 @@ void updateHotspot() {
     WiFi.getMode() == WIFI_AP &&
     WiFi.softAPIP() != IPAddress(0, 0, 0, 0);
 
-  if (hotspotOK)
+  if (hotspotOK) {
     return;
+  }
 
-  if (millis() - lastAPRetry < AP_RETRY_INTERVAL)
+  if (millis() - lastAPRetry < AP_RETRY_INTERVAL) {
     return;
+  }
 
   lastAPRetry = millis();
 
@@ -444,58 +482,74 @@ void updateHotspot() {
 // STATUS LEDS
 // =====================================================
 
+bool hasSensorFault() {
+
+  return !temperatureOK ||
+         mq2SensorFault ||
+         (state == MONITORING && mq2Baseline <= 0);
+}
+
 void updateStatusLeds() {
 
-  // GREEN: hotspot + monitoring + no sensor faults
+  bool sensorFault = hasSensorFault();
 
-  bool sensorFault =
-    !temperatureOK ||
-    mq2SensorFault ||
-    (state == MONITORING && mq2Baseline <= 0);
+  // SYSTEM STATUS:
+  // Blinking while system is not operational.
+  // Steady ON when hotspot and monitoring are ready.
 
-  bool operational =
+  bool systemOperational =
     hotspotOK &&
     state == MONITORING &&
     !sensorFault;
 
-  if (operational) {
+  if (systemOperational) {
 
-    greenLedState = true;
-    digitalWrite(LED_GREEN, HIGH);
+    systemStatusLedState = true;
+
+    digitalWrite(LED_SYSTEM_STATUS, LED_ON);
 
   } else {
 
-    if (millis() - lastGreenBlink >= 500UL) {
+    if (millis() - lastSystemStatusBlink >= 500UL) {
 
-      lastGreenBlink = millis();
+      lastSystemStatusBlink = millis();
 
-      greenLedState = !greenLedState;
+      systemStatusLedState = !systemStatusLedState;
 
-      digitalWrite(LED_GREEN,
-                   greenLedState ? HIGH : LOW);
+      digitalWrite(
+        LED_SYSTEM_STATUS,
+        systemStatusLedState ? LED_ON : LED_OFF
+      );
     }
   }
 
-  // YELLOW: initial conditioning,
-  // stabilization or calibration
+  // CALIBRATION STATUS:
+  // ON during initial conditioning, stabilization
+  // and calibration.
 
   bool calibrationInProgress =
     state == INITIAL_PREHEAT ||
     state == STABILIZATION ||
     state == CALIBRATION;
 
-  digitalWrite(LED_YELLOW,
-               calibrationInProgress ? HIGH : LOW);
+  digitalWrite(
+    LED_CALIBRATION_STATUS,
+    calibrationInProgress ? LED_ON : LED_OFF
+  );
 
-  // RED: smoke alert
+  // SMOKE ALERT
 
-  digitalWrite(LED_RED,
-               smokeAlert ? HIGH : LOW);
+  digitalWrite(
+    LED_SMOKE_ALERT,
+    smokeAlert ? LED_ON : LED_OFF
+  );
 
-  // BLUE: sensor fault
+  // SENSOR FAULT
 
-  digitalWrite(LED_BLUE,
-               sensorFault ? HIGH : LOW);
+  digitalWrite(
+    LED_SENSOR_FAULT,
+    sensorFault ? LED_ON : LED_OFF
+  );
 }
 
 // =====================================================
@@ -507,11 +561,8 @@ String getPreheatRemaining() {
   uint64_t remaining =
     INITIAL_PREHEAT_MS - preheatElapsed;
 
-  uint64_t hours =
-    remaining / 3600000ULL;
-
-  uint64_t minutes =
-    (remaining / 60000ULL) % 60ULL;
+  uint64_t hours = remaining / 3600000ULL;
+  uint64_t minutes = (remaining / 60000ULL) % 60ULL;
 
   return String((unsigned long)hours) +
          " h " +
@@ -525,10 +576,11 @@ void handleData() {
 
   json += "\"temperature\":";
 
-  if (temperatureOK)
+  if (temperatureOK) {
     json += String(temperature, 1);
-  else
+  } else {
     json += "null";
+  }
 
   json += ",\"temperatureOK\":";
   json += temperatureOK ? "true" : "false";
@@ -547,6 +599,9 @@ void handleData() {
 
   json += ",\"mq2SensorFault\":";
   json += mq2SensorFault ? "true" : "false";
+
+  json += ",\"sensorFault\":";
+  json += hasSensorFault() ? "true" : "false";
 
   json += ",\"hotspotOK\":";
   json += hotspotOK ? "true" : "false";
@@ -582,9 +637,11 @@ void handleCalibration() {
 
   } else {
 
-    server.send(409,
-                "text/plain",
-                "Calibration unavailable");
+    server.send(
+      409,
+      "text/plain",
+      "Calibration unavailable"
+    );
   }
 }
 
@@ -692,13 +749,14 @@ button:disabled {
 <div id="hotspot"></div>
 <div id="preheat"></div>
 <div id="calibrationCount"></div>
+<div id="sensorStatus"></div>
 </div>
 
 <div class="card">
 <h2>Calibration</h2>
 
 <p>
-Calibration must be performed in clean air.
+Perform calibration in clean air.
 </p>
 
 <button id="calibrateButton"
@@ -753,8 +811,8 @@ async function refresh() {
 
     document.getElementById('mq2Status').textContent =
       d.mq2SensorFault
-        ? 'MQ-2 sensor fault detected'
-        : 'MQ-2 electrical reading OK';
+        ? 'MQ-2 electrical anomaly detected'
+        : 'MQ-2 reading within ADC limits';
 
     document.getElementById('mq2Status').className =
       d.mq2SensorFault ? 'alert' : 'good';
@@ -776,6 +834,14 @@ async function refresh() {
       d.state === 'Calibration en cours'
         ? 'Samples : ' + d.calibrationCount + '/100'
         : '';
+
+    document.getElementById('sensorStatus').textContent =
+      d.sensorFault
+        ? 'Sensor fault detected'
+        : 'Sensors OK';
+
+    document.getElementById('sensorStatus').className =
+      d.sensorFault ? 'alert' : 'good';
 
     const btn =
       document.getElementById('calibrateButton');
@@ -837,17 +903,17 @@ void setup() {
 
   Serial.begin(115200);
 
-  // LED outputs
+  // Initialize LED outputs
 
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_YELLOW, OUTPUT);
-  pinMode(LED_RED, OUTPUT);
-  pinMode(LED_BLUE, OUTPUT);
+  pinMode(LED_SYSTEM_STATUS, OUTPUT);
+  pinMode(LED_CALIBRATION_STATUS, OUTPUT);
+  pinMode(LED_SMOKE_ALERT, OUTPUT);
+  pinMode(LED_SENSOR_FAULT, OUTPUT);
 
-  digitalWrite(LED_GREEN, LOW);
-  digitalWrite(LED_YELLOW, LOW);
-  digitalWrite(LED_RED, LOW);
-  digitalWrite(LED_BLUE, HIGH);
+  digitalWrite(LED_SYSTEM_STATUS, LED_OFF);
+  digitalWrite(LED_CALIBRATION_STATUS, LED_OFF);
+  digitalWrite(LED_SMOKE_ALERT, LED_OFF);
+  digitalWrite(LED_SENSOR_FAULT, LED_ON);
 
   // EEPROM
 
@@ -860,8 +926,6 @@ void setup() {
   sensors.setResolution(12);
   sensors.setWaitForConversion(false);
 
-  requestTemperature();
-
   // MQ2
 
   lastMQ2Read = millis();
@@ -870,8 +934,7 @@ void setup() {
 
   WiFi.mode(WIFI_AP);
 
-  hotspotOK =
-    WiFi.softAP(ssid, password);
+  hotspotOK = WiFi.softAP(ssid, password);
 
   Serial.println();
   Serial.println("Fumoir Cold");
@@ -890,19 +953,17 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/data", handleData);
-  server.on("/calibrate",
-            HTTP_POST,
-            handleCalibration);
+  server.on("/calibrate", HTTP_POST, handleCalibration);
 
   server.begin();
 
-  // Timers
+  // Initialize timers
 
   lastPreheatUpdate = millis();
   lastSave = millis();
 
-  lastTempRequest = millis();
   lastTempRefresh = millis();
+  requestTemperature();
 
   lastAPRetry = millis();
 
