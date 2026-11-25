@@ -7,76 +7,102 @@
 #include <EEPROM.h>
 #include <math.h>
 
-// =====================================================
-// CONFIGURATION DES BROCHES
-// =====================================================
+// ============================================================
+// BROCHAGE - NODEMCU ESP8266
+// ============================================================
 
-#define DS18B20_PIN D0
-#define MQ2_PIN A0
+#define PIN_DS18B20       D0
+#define PIN_LED_SYSTEM    D1
+#define PIN_LED_CALIB     D2
+#define PIN_LED_SMOKE     D5
+#define PIN_LED_FAULT     D6
+#define PIN_MQ2           A0
 
-#define LED_SYSTEM_STATUS       D1
-#define LED_CALIBRATION_STATUS  D2
-#define LED_SMOKE_ALERT         D5
-#define LED_SENSOR_FAULT        D6
-
-// Adapter ces deux valeurs au cablage des LED
+// LEDs actives a HIGH.
+// Inverser ces deux valeurs si les LEDs sont actives a LOW.
 #define LED_ON  HIGH
 #define LED_OFF LOW
 
-// =====================================================
-// CONFIGURATION WIFI
-// =====================================================
+// ============================================================
+// WIFI
+// ============================================================
 
-const char* AP_SSID = "FUMOIR_COLD";
-const char* AP_PASSWORD = "Fumage2026";
+const char* WIFI_SSID = "FUMOIR_COLD";
+const char* WIFI_PASSWORD = "Fumage2026";
 
 ESP8266WebServer server(80);
 
-// =====================================================
+// ============================================================
 // CAPTEURS
-// =====================================================
+// ============================================================
 
-OneWire oneWire(DS18B20_PIN);
+OneWire oneWire(PIN_DS18B20);
 DallasTemperature ds18b20(&oneWire);
 
-// =====================================================
-// PARAMETRES GENERAUX
-// =====================================================
+// ============================================================
+// PARAMETRES DU SYSTEME
+// ============================================================
 
-// Conditionnement initial du MQ-2 : 24 heures
+// Conditionnement initial : 24 heures
 const uint64_t INITIAL_PREHEAT_MS =
     24ULL * 60ULL * 60ULL * 1000ULL;
 
 // Stabilisation avant calibration : 5 minutes
-const unsigned long STABILIZATION_MS = 300000UL;
+const unsigned long CALIBRATION_STABILIZATION_MS = 300000UL;
 
-// Calibration : 100 mesures espacées de 200 ms
+// Nombre de mesures pour la calibration
 const int CALIBRATION_SAMPLES = 100;
+
+// Intervalle entre les mesures de calibration
 const unsigned long CALIBRATION_INTERVAL_MS = 200UL;
 
-// Marge sous la moyenne de calibration
-// Exemple : moyenne 400 -> seuil minimal 340
+// Marge de securite : seuil minimum = moyenne - 15 %
 const float MIN_SMOKE_MARGIN_PERCENT = 15.0;
 
-// Seuils de detection d'une anomalie ADC
+// Limites de detection d'un defaut ADC
 const int MQ2_ADC_MIN = 5;
 const int MQ2_ADC_MAX = 1018;
 
-// Temporisations
+// Sauvegarde EEPROM toutes les 5 minutes
 const unsigned long EEPROM_SAVE_INTERVAL_MS = 300000UL;
-const unsigned long TEMP_CONVERSION_MS = 750UL;
-const unsigned long TEMP_REFRESH_MS = 2000UL;
-const unsigned long MQ2_REFRESH_MS = 500UL;
-const unsigned long SERIAL_REFRESH_MS = 1000UL;
-const unsigned long LED_REFRESH_MS = 500UL;
-const unsigned long AP_RETRY_INTERVAL_MS = 10000UL;
 
-// Delai maximal d'acquisition de la calibration
+// Rafraichissement des capteurs
+const unsigned long DS18B20_INTERVAL_MS = 2000UL;
+const unsigned long DS18B20_CONVERSION_MS = 750UL;
+const unsigned long MQ2_INTERVAL_MS = 500UL;
+
+// Moniteur serie
+const unsigned long SERIAL_INTERVAL_MS = 1000UL;
+
+// LEDs
+const unsigned long LED_BLINK_INTERVAL_MS = 500UL;
+
+// Verification du hotspot
+const unsigned long WIFI_CHECK_INTERVAL_MS = 10000UL;
+
+// Timeout d'acquisition de calibration
 const unsigned long CALIBRATION_TIMEOUT_MS = 60000UL;
 
-// =====================================================
+// ============================================================
+// EEPROM
+// ============================================================
+
+const uint32_t EEPROM_MAGIC = 0xF0A01235;
+const int EEPROM_SIZE = 128;
+
+struct PersistentData {
+  uint32_t magic;
+  uint64_t preheatElapsed;
+  int32_t smokeThreshold;
+  uint8_t conditioned;
+  uint8_t reserved[3];
+};
+
+PersistentData persistentData;
+
+// ============================================================
 // ETATS DU SYSTEME
-// =====================================================
+// ============================================================
 
 enum SystemState {
   INITIAL_PREHEAT,
@@ -88,238 +114,311 @@ enum SystemState {
 
 SystemState systemState = INITIAL_PREHEAT;
 
-// =====================================================
-// EEPROM
-// =====================================================
+// ============================================================
+// VARIABLES
+// ============================================================
 
-struct PersistentData {
-  uint32_t magic;
-  uint64_t preheatElapsed;
-  int smokeThreshold;
-  bool conditioned;
-};
-
-const uint32_t EEPROM_MAGIC = 0xF0A01235;
-const int EEPROM_SIZE = 128;
-
-PersistentData persistentData;
-
-// =====================================================
-// VARIABLES CAPTEURS
-// =====================================================
-
-float temperatureC = NAN;
+// Temperature
+float temperature = NAN;
 bool temperatureOK = false;
 
+// MQ-2
 int mq2Raw = 0;
 int smokeThreshold = 0;
-
 float smokeVariation = 0.0;
-bool smokeAlert = false;
 bool mq2SensorFault = false;
 
-// Moyenne obtenue pendant la calibration
-int calibrationAverage = 0;
+// Etat de la fumee
+bool smokeAlert = false;
 
-// =====================================================
-// VARIABLES TEMPORELLES
-// =====================================================
-
-unsigned long lastTempRequest = 0;
-unsigned long lastTempRefresh = 0;
-bool tempConversionPending = false;
-
-unsigned long lastMQ2Refresh = 0;
-unsigned long lastSerialRefresh = 0;
-
-unsigned long lastPreheatUpdate = 0;
-unsigned long lastEEPROMsave = 0;
-
-unsigned long stabilizationStart = 0;
-unsigned long calibrationStart = 0;
+// Calibration
+int calibrationCount = 0;
+long calibrationSum = 0;
+float calibrationAverage = 0.0;
+unsigned long calibrationStartTime = 0;
 unsigned long lastCalibrationSample = 0;
 
-unsigned long lastLEDUpdate = 0;
-unsigned long lastAPRetry = 0;
-
-// =====================================================
-// CONDITIONNEMENT INITIAL
-// =====================================================
-
+// Conditionnement
 uint64_t preheatElapsed = 0;
-bool preheatCompleted = false;
+unsigned long lastPreheatUpdate = 0;
+unsigned long lastEEPROMSave = 0;
 
-// =====================================================
-// CALIBRATION
-// =====================================================
+// Temporisations
+unsigned long lastTemperatureRequest = 0;
+unsigned long temperatureRequestTime = 0;
+unsigned long lastMQ2Read = 0;
+unsigned long lastSerialPrint = 0;
+unsigned long lastLEDUpdate = 0;
+unsigned long lastWiFiCheck = 0;
 
-int calibrationCount = 0;
-int calibrationAttempts = 0;
-long calibrationSum = 0;
+// Etat des capteurs
+bool dsConversionPending = false;
 
-// =====================================================
-// WIFI
-// =====================================================
+// Wi-Fi
+bool hotspotActive = false;
 
-bool hotspotOK = false;
+// ============================================================
+// FONCTIONS GENERALES
+// ============================================================
 
-// =====================================================
-// LED
-// =====================================================
+const char* getStateName() {
+  switch (systemState) {
+    case INITIAL_PREHEAT:
+      return "Conditionnement initial";
 
-bool systemLedState = false;
+    case WAIT_CALIBRATION:
+      return "Calibration necessaire";
 
-// =====================================================
-// EEPROM : SAUVEGARDE
-// =====================================================
+    case STABILIZATION:
+      return "Stabilisation";
+
+    case CALIBRATION:
+      return "Calibration en cours";
+
+    case MONITORING:
+      return "Surveillance active";
+  }
+
+  return "Etat inconnu";
+}
+
+int getStateCode() {
+  return (int)systemState;
+}
+
+bool isCalibrationPossible() {
+  return (
+    systemState == WAIT_CALIBRATION ||
+    systemState == MONITORING
+  );
+}
+
+bool hasSensorFault() {
+  return (!temperatureOK || mq2SensorFault);
+}
+
+uint64_t getPreheatRemaining() {
+  if (preheatElapsed >= INITIAL_PREHEAT_MS) {
+    return 0;
+  }
+
+  return INITIAL_PREHEAT_MS - preheatElapsed;
+}
+
+// ============================================================
+// EEPROM
+// ============================================================
 
 void saveEEPROM() {
 
   persistentData.magic = EEPROM_MAGIC;
   persistentData.preheatElapsed = preheatElapsed;
   persistentData.smokeThreshold = smokeThreshold;
-  persistentData.conditioned = preheatCompleted;
+  persistentData.conditioned =
+      (preheatElapsed >= INITIAL_PREHEAT_MS) ? 1 : 0;
 
   EEPROM.put(0, persistentData);
   EEPROM.commit();
 
-}
+  lastEEPROMSave = millis();
 
-// =====================================================
-// EEPROM : LECTURE
-// =====================================================
+  Serial.println("[EEPROM] Sauvegarde effectuee");
+}
 
 void loadEEPROM() {
 
+  EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(0, persistentData);
 
   if (persistentData.magic != EEPROM_MAGIC) {
 
+    Serial.println("[EEPROM] Donnees absentes ou invalides");
+    Serial.println("[EEPROM] Initialisation du systeme");
+
     preheatElapsed = 0;
     smokeThreshold = 0;
-    preheatCompleted = false;
 
     saveEEPROM();
 
+    systemState = INITIAL_PREHEAT;
     return;
   }
 
   preheatElapsed = persistentData.preheatElapsed;
   smokeThreshold = persistentData.smokeThreshold;
-  preheatCompleted = persistentData.conditioned;
 
-  if (preheatElapsed >= INITIAL_PREHEAT_MS) {
+  if (preheatElapsed > INITIAL_PREHEAT_MS) {
     preheatElapsed = INITIAL_PREHEAT_MS;
-    preheatCompleted = true;
   }
 
-  if (!preheatCompleted) {
+  Serial.println("[EEPROM] Donnees restaurees");
+  Serial.print("[EEPROM] Conditionnement : ");
+  Serial.print((unsigned long)(preheatElapsed / 3600000ULL));
+  Serial.println(" heures");
 
+  Serial.print("[EEPROM] Seuil minimum : ");
+  Serial.println(smokeThreshold);
+
+  if (preheatElapsed >= INITIAL_PREHEAT_MS) {
+
+    if (smokeThreshold > 0) {
+      systemState = MONITORING;
+    } else {
+      systemState = WAIT_CALIBRATION;
+    }
+
+  } else {
     systemState = INITIAL_PREHEAT;
+  }
+}
 
-  } else if (smokeThreshold > 0) {
+// ============================================================
+// WIFI / HOTSPOT
+// ============================================================
 
-    systemState = MONITORING;
+void startHotspot() {
+
+  WiFi.mode(WIFI_AP);
+
+  bool result = WiFi.softAP(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  hotspotActive = result;
+
+  if (result) {
+
+    Serial.println("[WIFI] Hotspot actif");
+
+    Serial.print("[WIFI] SSID : ");
+    Serial.println(WIFI_SSID);
+
+    Serial.print("[WIFI] Adresse IP : ");
+    Serial.println(WiFi.softAPIP());
 
   } else {
 
-    systemState = WAIT_CALIBRATION;
-
+    Serial.println("[WIFI] Echec du demarrage du hotspot");
   }
-
 }
 
-// =====================================================
-// TEMPERATURE DS18B20
-// =====================================================
+void updateHotspot() {
+
+  unsigned long now = millis();
+
+  if (now - lastWiFiCheck < WIFI_CHECK_INTERVAL_MS) {
+    return;
+  }
+
+  lastWiFiCheck = now;
+
+  IPAddress ip = WiFi.softAPIP();
+
+  hotspotActive =
+    (WiFi.getMode() == WIFI_AP ||
+     WiFi.getMode() == WIFI_AP_STA) &&
+    ip != IPAddress(0, 0, 0, 0);
+
+  if (!hotspotActive) {
+
+    Serial.println("[WIFI] Hotspot indisponible, tentative de redemarrage");
+
+    startHotspot();
+  }
+}
+
+// ============================================================
+// DS18B20
+// ============================================================
 
 void updateTemperature() {
 
   unsigned long now = millis();
 
-  // Demande de conversion sans bloquer le programme
-  if (!tempConversionPending &&
-      now - lastTempRefresh >= TEMP_REFRESH_MS) {
-
-    ds18b20.requestTemperatures();
-
-    lastTempRequest = now;
-    lastTempRefresh = now;
-    tempConversionPending = true;
-
-  }
-
-  // Lecture une fois la conversion terminee
-  if (tempConversionPending &&
-      now - lastTempRequest >= TEMP_CONVERSION_MS) {
+  // Recuperation du resultat de conversion
+  if (dsConversionPending &&
+      now - temperatureRequestTime >= DS18B20_CONVERSION_MS) {
 
     float value = ds18b20.getTempCByIndex(0);
 
     if (value != DEVICE_DISCONNECTED_C &&
-        value >= -55.0 &&
-        value <= 125.0) {
+        value > -55.0 &&
+        value < 125.0 &&
+        value != 85.0) {
 
-      temperatureC = value;
+      temperature = value;
       temperatureOK = true;
 
     } else {
 
       temperatureOK = false;
-
     }
 
-    tempConversionPending = false;
-
+    dsConversionPending = false;
   }
 
+  // Demande d'une nouvelle conversion
+  if (!dsConversionPending &&
+      now - lastTemperatureRequest >= DS18B20_INTERVAL_MS) {
+
+    ds18b20.requestTemperatures();
+
+    lastTemperatureRequest = now;
+    temperatureRequestTime = now;
+    dsConversionPending = true;
+  }
 }
 
-// =====================================================
-// CAPTEUR MQ-2
-// =====================================================
+// ============================================================
+// MQ-2
+// ============================================================
 
 void updateMQ2() {
 
   unsigned long now = millis();
 
-  if (now - lastMQ2Refresh < MQ2_REFRESH_MS) {
+  if (now - lastMQ2Read < MQ2_INTERVAL_MS) {
     return;
   }
 
-  lastMQ2Refresh = now;
+  lastMQ2Read = now;
 
-  mq2Raw = analogRead(MQ2_PIN);
+  mq2Raw = analogRead(PIN_MQ2);
 
   mq2SensorFault =
-      (mq2Raw <= MQ2_ADC_MIN ||
-       mq2Raw >= MQ2_ADC_MAX);
+    (mq2Raw <= MQ2_ADC_MIN ||
+     mq2Raw >= MQ2_ADC_MAX);
 
-  // Ecart par rapport au seuil minimal
   if (smokeThreshold > 0) {
 
     smokeVariation =
-        ((float)(mq2Raw - smokeThreshold) /
-         (float)smokeThreshold) * 100.0;
+      ((float)(mq2Raw - smokeThreshold) /
+       (float)smokeThreshold) * 100.0;
 
   } else {
 
     smokeVariation = 0.0;
-
   }
 
-  // Nouvelle logique :
-  // alerte lorsque la fumee passe sous le seuil minimal
-  smokeAlert =
-      (systemState == MONITORING &&
-       !mq2SensorFault &&
-       smokeThreshold > 0 &&
-       mq2Raw < smokeThreshold);
+  // IMPORTANT :
+  // Le fonctionnement suppose que la valeur analogique
+  // augmente lorsque la quantite de fumee augmente.
+  //
+  // Il n'existe PAS de seuil maximum.
+  // Une alerte est declenchee uniquement lorsque
+  // la valeur passe sous le seuil minimum.
 
+  smokeAlert =
+    (systemState == MONITORING &&
+     !mq2SensorFault &&
+     smokeThreshold > 0 &&
+     mq2Raw < smokeThreshold);
 }
 
-// =====================================================
+// ============================================================
 // CONDITIONNEMENT INITIAL
-// =====================================================
+// ============================================================
 
 void updatePreheat() {
 
@@ -329,107 +428,105 @@ void updatePreheat() {
 
   unsigned long now = millis();
 
-  preheatElapsed += now - lastPreheatUpdate;
+  unsigned long elapsed = now - lastPreheatUpdate;
+
   lastPreheatUpdate = now;
 
-  // Sauvegarde periodique de la progression
-  if (now - lastEEPROMsave >= EEPROM_SAVE_INTERVAL_MS) {
-
-    saveEEPROM();
-    lastEEPROMsave = now;
-
-  }
+  preheatElapsed += elapsed;
 
   if (preheatElapsed >= INITIAL_PREHEAT_MS) {
 
     preheatElapsed = INITIAL_PREHEAT_MS;
-    preheatCompleted = true;
 
     systemState = WAIT_CALIBRATION;
 
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("[SYSTEME] CONDITIONNEMENT TERMINE");
+    Serial.println("[SYSTEME] Calibration necessaire");
+    Serial.println("================================");
+
     saveEEPROM();
 
-    Serial.println();
-    Serial.println(">>> CONDITIONNEMENT INITIAL TERMINE");
-    Serial.println(">>> Demarrer le fumoir avec une fumee satisfaisante");
-    Serial.println(">>> Puis lancer la calibration");
-
+    return;
   }
 
+  if (now - lastEEPROMSave >= EEPROM_SAVE_INTERVAL_MS) {
+    saveEEPROM();
+  }
 }
 
-// =====================================================
-// DEMARRAGE CALIBRATION
-// =====================================================
+// ============================================================
+// CALIBRATION
+// ============================================================
 
 void startCalibration() {
 
-  if (systemState != WAIT_CALIBRATION &&
-      systemState != MONITORING) {
+  if (!isCalibrationPossible()) {
+    Serial.println("[CALIBRATION] Impossible dans cet etat");
     return;
   }
 
   calibrationCount = 0;
-  calibrationAttempts = 0;
   calibrationSum = 0;
+  calibrationAverage = 0;
+
+  calibrationStartTime = millis();
+  lastCalibrationSample = 0;
 
   smokeAlert = false;
-
-  stabilizationStart = millis();
 
   systemState = STABILIZATION;
 
   Serial.println();
-  Serial.println(">>> DEBUT DE LA CALIBRATION");
-  Serial.println(">>> Verifier que la fumee est suffisante");
-  Serial.println(">>> Stabilisation : 5 minutes");
-
+  Serial.println("================================");
+  Serial.println("[CALIBRATION] Demarrage");
+  Serial.println("[CALIBRATION] Stabilisation de 5 minutes");
+  Serial.println("[CALIBRATION] Le fumoir doit produire une fumee satisfaisante");
+  Serial.println("================================");
 }
-
-// =====================================================
-// CALIBRATION
-// =====================================================
 
 void updateCalibration() {
 
   unsigned long now = millis();
 
-  // Phase 1 : stabilisation
+  // ----------------------------------------------------------
+  // ETAPE 1 : STABILISATION
+  // ----------------------------------------------------------
+
   if (systemState == STABILIZATION) {
 
-    if (now - stabilizationStart >= STABILIZATION_MS) {
+    if (now - calibrationStartTime >=
+        CALIBRATION_STABILIZATION_MS) {
 
       systemState = CALIBRATION;
 
-      calibrationCount = 0;
-      calibrationAttempts = 0;
-      calibrationSum = 0;
-
+      calibrationStartTime = now;
       lastCalibrationSample = 0;
-      calibrationStart = now;
 
-      Serial.println();
-      Serial.println(">>> STABILISATION TERMINEE");
-      Serial.println(">>> Acquisition des 100 mesures");
-
+      Serial.println("[CALIBRATION] Stabilisation terminee");
+      Serial.println("[CALIBRATION] Acquisition des mesures");
     }
 
     return;
   }
 
-  // Phase 2 : acquisition
+  // ----------------------------------------------------------
+  // ETAPE 2 : ACQUISITION
+  // ----------------------------------------------------------
+
   if (systemState != CALIBRATION) {
     return;
   }
 
-  // Securite : abandon si les mesures sont invalides
-  if (now - calibrationStart >= CALIBRATION_TIMEOUT_MS) {
+  // Timeout de l'acquisition
+  if (now - calibrationStartTime >
+      CALIBRATION_TIMEOUT_MS) {
+
+    Serial.println("[CALIBRATION] ERREUR : timeout");
+    Serial.println("[CALIBRATION] Calibration abandonnee");
 
     systemState = WAIT_CALIBRATION;
-
-    Serial.println();
-    Serial.println(">>> ERREUR : calibration abandonnee");
-    Serial.println(">>> Verifier le capteur MQ-2");
 
     return;
   }
@@ -440,628 +537,1172 @@ void updateCalibration() {
   }
 
   lastCalibrationSample = now;
-  calibrationAttempts++;
 
-  int value = analogRead(MQ2_PIN);
+  int sample = analogRead(PIN_MQ2);
 
-  if (value <= MQ2_ADC_MIN ||
-      value >= MQ2_ADC_MAX) {
+  if (sample <= MQ2_ADC_MIN ||
+      sample >= MQ2_ADC_MAX) {
+
+    Serial.println("[CALIBRATION] Mesure invalide, ignoree");
     return;
   }
 
-  calibrationSum += value;
+  calibrationSum += sample;
   calibrationCount++;
 
-  if (calibrationCount % 10 == 0) {
+  Serial.print("[CALIBRATION] Mesure ");
+  Serial.print(calibrationCount);
+  Serial.print("/");
+  Serial.print(CALIBRATION_SAMPLES);
+  Serial.print(" : ");
+  Serial.println(sample);
 
-    Serial.print("Calibration : ");
-    Serial.print(calibrationCount);
-    Serial.print("/");
-    Serial.print(CALIBRATION_SAMPLES);
-    Serial.print(" - derniere mesure : ");
-    Serial.println(value);
+  // ----------------------------------------------------------
+  // FIN DE CALIBRATION
+  // ----------------------------------------------------------
 
-  }
-
-  // Acquisition terminee
   if (calibrationCount >= CALIBRATION_SAMPLES) {
 
     calibrationAverage =
-        calibrationSum / CALIBRATION_SAMPLES;
+      (float)calibrationSum /
+      (float)CALIBRATION_SAMPLES;
 
-    // Calcul du seuil minimal
     smokeThreshold =
-        (int)(calibrationAverage *
-        (1.0 - MIN_SMOKE_MARGIN_PERCENT / 100.0));
+      (int)round(
+        calibrationAverage *
+        (1.0 - MIN_SMOKE_MARGIN_PERCENT / 100.0)
+      );
 
-    if (smokeThreshold > 0) {
-
-      systemState = MONITORING;
-
-      smokeAlert = false;
-
-      saveEEPROM();
-
-      Serial.println();
-      Serial.println(">>> CALIBRATION TERMINEE");
-      Serial.print("Moyenne mesuree       : ");
-      Serial.println(calibrationAverage);
-
-      Serial.print("Marge minimale        : ");
-      Serial.print(MIN_SMOKE_MARGIN_PERCENT);
-      Serial.println(" %");
-
-      Serial.print("Seuil minimal de fumee: ");
-      Serial.println(smokeThreshold);
-
-      Serial.println(">>> SURVEILLANCE ACTIVE");
-
-    } else {
-
-      smokeThreshold = 0;
-      systemState = WAIT_CALIBRATION;
-
-      Serial.println(">>> ERREUR : seuil de calibration invalide");
-
+    if (smokeThreshold < 1) {
+      smokeThreshold = 1;
     }
 
-  }
+    systemState = MONITORING;
 
+    saveEEPROM();
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("[CALIBRATION] TERMINEE");
+    Serial.print("[CALIBRATION] Moyenne : ");
+    Serial.println(calibrationAverage);
+    Serial.print("[CALIBRATION] Seuil minimum : ");
+    Serial.println(smokeThreshold);
+    Serial.println("[CALIBRATION] Surveillance active");
+    Serial.println("================================");
+  }
 }
 
-// =====================================================
-// WIFI : HOTSPOT
-// =====================================================
+// ============================================================
+// LEDS
+// ============================================================
 
-void updateHotspot() {
-
-  bool connected =
-      (WiFi.getMode() == WIFI_AP &&
-       WiFi.softAPIP() != IPAddress(0, 0, 0, 0));
-
-  hotspotOK = connected;
-
-  if (!hotspotOK &&
-      millis() - lastAPRetry >= AP_RETRY_INTERVAL_MS) {
-
-    lastAPRetry = millis();
-
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-
-    Serial.println(">>> Tentative de redemarrage du hotspot");
-
-  }
-
-}
-
-// =====================================================
-// ETAT CAPTEURS
-// =====================================================
-
-bool hasSensorFault() {
-
-  if (!temperatureOK) {
-    return true;
-  }
-
-  if (mq2SensorFault) {
-    return true;
-  }
-
-  if (systemState == MONITORING &&
-      smokeThreshold <= 0) {
-    return true;
-  }
-
-  return false;
-
-}
-
-// =====================================================
-// GESTION DES LED
-// =====================================================
-
-void updateStatusLeds() {
+void updateLEDs() {
 
   unsigned long now = millis();
 
-  bool sensorFault = hasSensorFault();
+  bool blinkState =
+    ((now / LED_BLINK_INTERVAL_MS) % 2) == 0;
+
+  // ----------------------------------------------------------
+  // LED VERTE : SYSTEME OPERATIONNEL
+  // ----------------------------------------------------------
 
   bool systemOperational =
-      hotspotOK &&
-      systemState == MONITORING &&
-      !sensorFault;
+    hotspotActive &&
+    systemState == MONITORING &&
+    !hasSensorFault();
 
-  // LED systeme :
-  // fixe si le systeme est operationnel
-  // clignotante dans les autres cas
   if (systemOperational) {
 
-    digitalWrite(LED_SYSTEM_STATUS, LED_ON);
+    digitalWrite(PIN_LED_SYSTEM, LED_ON);
 
   } else {
 
-    if (now - lastLEDUpdate >= LED_REFRESH_MS) {
-
-      lastLEDUpdate = now;
-      systemLedState = !systemLedState;
-
-    }
-
     digitalWrite(
-      LED_SYSTEM_STATUS,
-      systemLedState ? LED_ON : LED_OFF
+      PIN_LED_SYSTEM,
+      blinkState ? LED_ON : LED_OFF
     );
-
   }
 
-  // LED calibration
+  // ----------------------------------------------------------
+  // LED JAUNE : CONDITIONNEMENT / CALIBRATION
+  // ----------------------------------------------------------
+
   bool calibrationActive =
-      (systemState == INITIAL_PREHEAT ||
-       systemState == STABILIZATION ||
-       systemState == CALIBRATION);
+    (systemState == INITIAL_PREHEAT ||
+     systemState == STABILIZATION ||
+     systemState == CALIBRATION);
 
   digitalWrite(
-    LED_CALIBRATION_STATUS,
+    PIN_LED_CALIB,
     calibrationActive ? LED_ON : LED_OFF
   );
 
-  // LED alerte fumee insuffisante
+  // ----------------------------------------------------------
+  // LED ROUGE : MANQUE DE FUMEE
+  // ----------------------------------------------------------
+
   digitalWrite(
-    LED_SMOKE_ALERT,
+    PIN_LED_SMOKE,
     smokeAlert ? LED_ON : LED_OFF
   );
 
-  // LED defaut capteur
+  // ----------------------------------------------------------
+  // LED BLEUE : DEFAUT CAPTEUR
+  // ----------------------------------------------------------
+
   digitalWrite(
-    LED_SENSOR_FAULT,
-    sensorFault ? LED_ON : LED_OFF
+    PIN_LED_FAULT,
+    hasSensorFault() ? LED_ON : LED_OFF
   );
-
 }
 
-// =====================================================
-// NOM DES ETATS
-// =====================================================
-
-String getStateName() {
-
-  switch (systemState) {
-
-    case INITIAL_PREHEAT:
-      return "Conditionnement initial en cours";
-
-    case WAIT_CALIBRATION:
-      return "Calibration requise";
-
-    case STABILIZATION:
-      return "Stabilisation MQ-2";
-
-    case CALIBRATION:
-      return "Calibration MQ-2";
-
-    case MONITORING:
-      return "Surveillance";
-
-    default:
-      return "Inconnu";
-
-  }
-
-}
-
-// =====================================================
-// FORMATAGE D'UNE DUREE
-// =====================================================
-
-String formatDuration(uint64_t durationMs) {
-
-  uint64_t totalSeconds = durationMs / 1000ULL;
-
-  uint64_t hours = totalSeconds / 3600ULL;
-  uint64_t minutes = (totalSeconds % 3600ULL) / 60ULL;
-
-  return String((unsigned long)hours) +
-         "h " +
-         String((unsigned long)minutes) +
-         "m";
-
-}
-
-// =====================================================
-// AFFICHAGE CONSOLE
-// =====================================================
+// ============================================================
+// MONITEUR SERIE
+// ============================================================
 
 void printSerialStatus() {
 
   unsigned long now = millis();
 
-  if (now - lastSerialRefresh < SERIAL_REFRESH_MS) {
+  if (now - lastSerialPrint < SERIAL_INTERVAL_MS) {
     return;
   }
 
-  lastSerialRefresh = now;
+  lastSerialPrint = now;
 
   Serial.println();
-  Serial.println("========================================");
-  Serial.println("             ETAT DU FUMOIR");
-  Serial.println("========================================");
+  Serial.println("--------------------------------");
 
-  Serial.print("Etat systeme       : ");
+  Serial.print("Etat systeme : ");
   Serial.println(getStateName());
 
-  Serial.print("Hotspot Wi-Fi      : ");
-  Serial.println(hotspotOK ? "ACTIF" : "INACTIF");
+  Serial.print("Hotspot WiFi : ");
+  Serial.println(hotspotActive ? "ACTIF" : "INACTIF");
 
-  Serial.print("Adresse IP         : ");
-  Serial.println(WiFi.softAPIP());
-
-  Serial.println();
-  Serial.println("--- CAPTEUR MQ-2 ---");
-
-  Serial.print("Valeur brute ADC   : ");
-  Serial.println(mq2Raw);
-
-  Serial.print("Moyenne calibration: ");
-
-  if (calibrationAverage > 0) {
-    Serial.println(calibrationAverage);
-  } else {
-    Serial.println("NON DISPONIBLE");
-  }
-
-  Serial.print("Seuil minimal      : ");
-
-  if (smokeThreshold > 0) {
-    Serial.println(smokeThreshold);
-  } else {
-    Serial.println("NON DEFINI");
-  }
-
-  Serial.print("Ecart au seuil     : ");
-  Serial.print(smokeVariation, 2);
-  Serial.println(" %");
-
-  Serial.print("Fumee suffisante   : ");
-
-  if (systemState != MONITORING) {
-    Serial.println("SURVEILLANCE INACTIVE");
-  } else {
-    Serial.println(smokeAlert ? "NON" : "OUI");
-  }
-
-  Serial.print("Defaut MQ-2        : ");
-  Serial.println(mq2SensorFault ? "OUI" : "NON");
-
-  Serial.println();
-  Serial.println("--- CAPTEUR DS18B20 ---");
-
-  Serial.print("Temperature        : ");
+  Serial.print("Temperature : ");
 
   if (temperatureOK) {
-    Serial.print(temperatureC, 2);
+    Serial.print(temperature, 1);
     Serial.println(" C");
   } else {
-    Serial.println("ERREUR / NON DETECTE");
+    Serial.println("DEFAUT");
   }
 
-  Serial.print("Etat               : ");
-  Serial.println(temperatureOK ? "OK" : "DEFAUT");
+  Serial.print("MQ-2 brut : ");
+  Serial.println(mq2Raw);
 
-  Serial.println();
-  Serial.println("--- CONDITIONNEMENT ---");
+  Serial.print("MQ-2 defaut : ");
+  Serial.println(mq2SensorFault ? "OUI" : "NON");
 
-  Serial.print("Duree ecoulee      : ");
-  Serial.println(formatDuration(preheatElapsed));
+  Serial.print("Seuil minimum fumee : ");
+  Serial.println(smokeThreshold);
+
+  Serial.print("Variation seuil : ");
+  Serial.print(smokeVariation, 1);
+  Serial.println(" %");
+
+  Serial.print("Alerte fumee : ");
+  Serial.println(smokeAlert ? "OUI - MANQUE DE FUMEE" : "NON");
+
+  Serial.print("Defaut capteur : ");
+  Serial.println(hasSensorFault() ? "OUI" : "NON");
 
   if (systemState == INITIAL_PREHEAT) {
 
-    uint64_t remaining =
-        INITIAL_PREHEAT_MS - preheatElapsed;
+    Serial.print("Conditionnement : ");
 
-    Serial.print("Duree restante     : ");
-    Serial.println(formatDuration(remaining));
+    Serial.print(
+      (float)preheatElapsed / 3600000.0,
+      2
+    );
 
-  } else {
-
-    Serial.println("Duree restante     : 0h 00m");
-
+    Serial.println(" / 24 heures");
   }
 
-  Serial.println();
-  Serial.println("--- DEFAUTS ---");
+  if (systemState == STABILIZATION) {
 
-  Serial.print("Defaut capteur     : ");
-  Serial.println(hasSensorFault() ? "OUI" : "NON");
+    unsigned long elapsed =
+      now - calibrationStartTime;
 
-  Serial.println("========================================");
+    Serial.print("Stabilisation restante : ");
 
+    Serial.print(
+      (CALIBRATION_STABILIZATION_MS - elapsed) / 1000
+    );
+
+    Serial.println(" secondes");
+  }
+
+  if (systemState == CALIBRATION) {
+
+    Serial.print("Calibration : ");
+    Serial.print(calibrationCount);
+    Serial.print("/");
+    Serial.println(CALIBRATION_SAMPLES);
+  }
+
+  Serial.println("--------------------------------");
 }
 
-// =====================================================
+// ============================================================
 // PAGE WEB
-// =====================================================
+// ============================================================
 
 const char MAIN_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="fr">
+
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fumoir froid</title>
+
+<title>Fumoir - Surveillance</title>
 
 <style>
-body {
-  font-family: Arial, sans-serif;
-  background: #20242a;
-  color: white;
-  text-align: center;
-  margin: 0;
-  padding: 20px;
+
+:root {
+  --background: #f3f5f8;
+  --card: #ffffff;
+  --text: #202936;
+  --muted: #788493;
+  --green: #15965a;
+  --green-bg: #e5f6ed;
+  --red: #d94343;
+  --red-bg: #fdeaea;
+  --orange: #d58b19;
+  --orange-bg: #fff3d9;
+  --blue: #337fc4;
+  --border: #e6eaf0;
 }
 
-h1 {
-  margin-bottom: 20px;
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+  background: var(--background);
+  color: var(--text);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.container {
+  max-width: 650px;
+  margin: auto;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 18px;
+}
+
+.logo {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+
+.logo span {
+  color: #e87932;
+}
+
+.wifi {
+  font-size: 12px;
+  font-weight: bold;
+  padding: 7px 11px;
+  border-radius: 20px;
+  background: var(--green-bg);
+  color: var(--green);
+}
+
+.wifi.off {
+  background: var(--red-bg);
+  color: var(--red);
 }
 
 .card {
-  background: #303740;
-  border-radius: 10px;
-  padding: 16px;
-  margin: 12px auto;
-  max-width: 440px;
+  background: var(--card);
+  border-radius: 16px;
+  padding: 18px;
+  margin-bottom: 13px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.035);
 }
 
-.value {
-  font-size: 28px;
-  font-weight: bold;
-  margin: 10px;
+.main-status {
+  border-left: 5px solid var(--green);
 }
 
-.label {
-  color: #b8c2cc;
+.main-status.alert {
+  border-left-color: var(--red);
+}
+
+.main-status.wait {
+  border-left-color: var(--orange);
+}
+
+.status-title {
+  font-size: 19px;
+  font-weight: 800;
+  margin-bottom: 6px;
+}
+
+.status-description {
   font-size: 13px;
+  color: var(--muted);
+  line-height: 1.5;
 }
 
-.status {
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.metric-label {
+  color: var(--muted);
+  font-size: 11px;
   font-weight: bold;
-  margin: 10px;
+  letter-spacing: 0.7px;
+  margin-bottom: 12px;
 }
 
-.ok {
-  color: #2ecc71;
+.metric-value {
+  font-size: 29px;
+  font-weight: 800;
+  margin-bottom: 8px;
 }
 
-.warning {
-  color: #f1c40f;
+.metric-unit {
+  font-size: 14px;
+  font-weight: normal;
+  color: var(--muted);
 }
 
-.alert {
-  color: #ff5555;
+.tag {
+  display: inline-block;
+  padding: 5px 9px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.tag.green {
+  background: var(--green-bg);
+  color: var(--green);
+}
+
+.tag.red {
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+.tag.orange {
+  background: var(--orange-bg);
+  color: var(--orange);
+}
+
+.tag.blue {
+  background: #e8f1fc;
+  color: var(--blue);
+}
+
+.section-title {
+  font-size: 15px;
+  font-weight: 800;
+  margin-bottom: 15px;
+}
+
+.smoke-value {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.smoke-number {
+  font-size: 30px;
+  font-weight: 800;
 }
 
 .progress {
-  background: #59616b;
-  height: 10px;
-  border-radius: 10px;
+  width: 100%;
+  height: 11px;
+  background: #e9edf1;
+  border-radius: 20px;
   overflow: hidden;
   margin: 12px 0;
 }
 
 .progress-bar {
-  background: #e5a33b;
-  height: 10px;
+  height: 100%;
   width: 0%;
+  background: var(--green);
+  border-radius: 20px;
+  transition: width 0.3s;
+}
+
+.progress-bar.red {
+  background: var(--red);
+}
+
+.progress-bar.orange {
+  background: var(--orange);
+}
+
+.small-text {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.sensor-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.sensor-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
 }
 
 button {
-  padding: 14px 20px;
-  font-size: 16px;
-  border: 0;
-  border-radius: 7px;
-  background: #16a085;
-  color: white;
-  cursor: pointer;
   width: 100%;
+  border: none;
+  border-radius: 12px;
+  padding: 15px;
+  font-size: 14px;
+  font-weight: bold;
+  cursor: pointer;
+  margin-top: 12px;
 }
 
-button:disabled {
-  background: #555;
+.button-primary {
+  background: #253447;
+  color: white;
+}
+
+.button-primary:disabled {
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
-.small {
-  color: #b8c2cc;
-  font-size: 12px;
+.details {
+  margin-top: 10px;
 }
+
+details summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: bold;
+  padding: 5px 0;
+}
+
+.detail-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.footer {
+  text-align: center;
+  font-size: 11px;
+  color: var(--muted);
+  padding: 10px;
+}
+
+.hidden {
+  display: none;
+}
+
+@media(max-width: 390px) {
+
+  body {
+    padding: 10px;
+  }
+
+  .metric-value {
+    font-size: 25px;
+  }
+
+  .card {
+    padding: 15px;
+  }
+}
+
 </style>
 </head>
 
 <body>
 
-<h1>FUMOIR FROID</h1>
+<div class="container">
 
-<div class="card">
-  <div class="label">ETAT DU SYSTEME</div>
-  <div class="value" id="state">...</div>
-  <div id="wifi" class="small">Hotspot : ...</div>
-</div>
+  <div class="header">
 
-<div class="card">
-  <div class="label">TEMPERATURE</div>
-  <div class="value" id="temperature">-- °C</div>
-  <div id="temperatureStatus"></div>
-</div>
+    <div class="logo">
+      <span>🔥</span> FUMOIR
+    </div>
 
-<div class="card">
-  <div class="label">NIVEAU DE FUMEE - MQ-2</div>
-  <div class="value" id="mq2">---</div>
+    <div id="wifi" class="wifi">
+      ● Connecté
+    </div>
 
-  <p>Seuil minimal : <b id="threshold">---</b></p>
-  <p>Ecart au seuil : <b id="variation">---</b> %</p>
-
-  <div id="smokeStatus" class="status">---</div>
-</div>
-
-<div class="card">
-  <div class="label">CONDITIONNEMENT INITIAL</div>
-  <div class="value" id="remaining">---</div>
-
-  <div class="progress">
-    <div class="progress-bar" id="progress"></div>
   </div>
 
-  <div class="small" id="elapsed">---</div>
-</div>
+  <!-- ETAT GENERAL -->
 
-<div class="card">
-  <div class="label">CALIBRATION DU SEUIL MINIMAL</div>
+  <div id="mainStatus" class="card main-status">
 
-  <p id="calibrationInfo">
-    Demarrer le fumoir et attendre une fumee satisfaisante.
-  </p>
+    <div id="statusTitle" class="status-title">
+      Initialisation...
+    </div>
 
-  <button id="calibrate" onclick="calibrate()">
-    Definir le seuil minimal
-  </button>
+    <div id="statusDescription" class="status-description">
+      Connexion au système de surveillance.
+    </div>
 
-  <p class="small">
-    La calibration comprend 5 minutes de stabilisation
-    puis 100 mesures.
-  </p>
-</div>
+  </div>
 
-<div class="card">
-  <div class="label">ETAT DES CAPTEURS</div>
-  <p>DS18B20 : <b id="dsStatus">---</b></p>
-  <p>MQ-2 : <b id="mqStatus">---</b></p>
+  <!-- TEMPERATURE ET FUMEE -->
+
+  <div class="grid">
+
+    <div class="card">
+
+      <div class="metric-label">
+        🌡 TEMPERATURE
+      </div>
+
+      <div class="metric-value">
+        <span id="temperature">--.-</span>
+        <span class="metric-unit">°C</span>
+      </div>
+
+      <span id="temperatureStatus" class="tag orange">
+        En attente
+      </span>
+
+    </div>
+
+    <div class="card">
+
+      <div class="metric-label">
+        ☁ NIVEAU DE FUMEE
+      </div>
+
+      <div id="smokeText" class="metric-value" style="font-size:21px">
+        En attente
+      </div>
+
+      <span id="smokeStatus" class="tag orange">
+        En attente
+      </span>
+
+    </div>
+
+  </div>
+
+  <!-- SURVEILLANCE FUMEE -->
+
+  <div class="card">
+
+    <div class="section-title">
+      Surveillance de la fumée
+    </div>
+
+    <div class="smoke-value">
+
+      <div>
+        <div class="small-text">Valeur du capteur MQ-2</div>
+        <div id="mq2" class="smoke-number">---</div>
+      </div>
+
+      <div style="text-align:right">
+        <div class="small-text">Seuil minimum</div>
+        <div id="threshold" style="font-size:20px;font-weight:bold">
+          ---
+        </div>
+      </div>
+
+    </div>
+
+    <div class="progress">
+      <div id="smokeBar" class="progress-bar"></div>
+    </div>
+
+    <div class="smoke-value">
+
+      <span class="small-text">
+        <span id="variation">--</span> % par rapport au seuil
+      </span>
+
+      <span id="smokeConclusion" class="small-text">
+        En attente
+      </span>
+
+    </div>
+
+    <div class="small-text" style="margin-top:12px">
+      Le système vérifie uniquement que le niveau de fumée
+      reste supérieur au seuil minimum défini lors de la calibration.
+    </div>
+
+  </div>
+
+  <!-- CONDITIONNEMENT -->
+
+  <div id="preheatCard" class="card hidden">
+
+    <div class="section-title">
+      Conditionnement initial
+    </div>
+
+    <div class="small-text">
+      Le capteur MQ-2 effectue son conditionnement initial.
+      Cette opération se poursuit automatiquement.
+    </div>
+
+    <div class="smoke-value" style="margin-top:15px">
+
+      <strong id="preheatProgress">0 %</strong>
+
+      <span id="preheatRemaining" class="small-text">
+        Temps restant : --
+      </span>
+
+    </div>
+
+    <div class="progress">
+      <div id="preheatBar" class="progress-bar orange"></div>
+    </div>
+
+  </div>
+
+  <!-- CALIBRATION -->
+
+  <div id="calibrationCard" class="card hidden">
+
+    <div class="section-title">
+      Calibration du détecteur
+    </div>
+
+    <div id="calibrationDescription" class="small-text">
+      Place le fumoir dans ses conditions normales de fonctionnement,
+      avec une fumée satisfaisante.
+    </div>
+
+    <div id="calibrationProgressContainer" class="hidden">
+
+      <div class="smoke-value" style="margin-top:15px">
+
+        <strong id="calibrationProgress">0 / 100</strong>
+
+        <span id="calibrationPercent" class="small-text">
+          0 %
+        </span>
+
+      </div>
+
+      <div class="progress">
+        <div id="calibrationBar" class="progress-bar orange"></div>
+      </div>
+
+    </div>
+
+    <button
+      id="calibrationButton"
+      class="button-primary"
+      onclick="startCalibration()">
+
+      Lancer la calibration
+
+    </button>
+
+  </div>
+
+  <!-- CAPTEURS -->
+
+  <div class="card">
+
+    <div class="section-title">
+      Etat des équipements
+    </div>
+
+    <div class="sensor-row">
+      <span>🌡 Sonde de température</span>
+      <span id="dsStatus" class="tag orange">---</span>
+    </div>
+
+    <div class="sensor-row">
+      <span>☁ Détecteur MQ-2</span>
+      <span id="mqStatus" class="tag orange">---</span>
+    </div>
+
+    <div class="sensor-row">
+      <span>📶 Point d'accès Wi-Fi</span>
+      <span id="wifiStatus" class="tag orange">---</span>
+    </div>
+
+  </div>
+
+  <!-- DETAILS TECHNIQUES -->
+
+  <div class="card details">
+
+    <details>
+
+      <summary>⚙ Détails techniques</summary>
+
+      <div style="margin-top:15px">
+
+        <div class="detail-row">
+          <span>Etat du système</span>
+          <strong id="technicalState">---</strong>
+        </div>
+
+        <div class="detail-row">
+          <span>Valeur ADC MQ-2</span>
+          <strong id="technicalMQ2">---</strong>
+        </div>
+
+        <div class="detail-row">
+          <span>Seuil minimum</span>
+          <strong id="technicalThreshold">---</strong>
+        </div>
+
+        <div class="detail-row">
+          <span>Moyenne calibration</span>
+          <strong id="technicalAverage">---</strong>
+        </div>
+
+        <div class="detail-row">
+          <span>Mesures calibration</span>
+          <strong id="technicalSamples">---</strong>
+        </div>
+
+      </div>
+
+    </details>
+
+  </div>
+
+  <div class="footer">
+    FUMOIR COLD · Mise à jour automatique
+    <br>
+    <span id="lastUpdate">Connexion...</span>
+  </div>
+
 </div>
 
 <script>
 
-function formatDuration(ms) {
-  let total = Math.floor(ms / 1000);
-  let h = Math.floor(total / 3600);
-  let m = Math.floor((total % 3600) / 60);
+function setTag(id, text, color) {
 
-  return h + "h " + m + "min";
+  const element = document.getElementById(id);
+
+  element.textContent = text;
+  element.className = "tag " + color;
 }
 
-async function refresh() {
+function setText(id, text) {
+
+  document.getElementById(id).textContent = text;
+}
+
+function formatDuration(milliseconds) {
+
+  let seconds = Math.floor(milliseconds / 1000);
+
+  let hours = Math.floor(seconds / 3600);
+  let minutes = Math.floor((seconds % 3600) / 60);
+
+  return hours + " h " + minutes + " min";
+}
+
+function updateDashboard(data) {
+
+  // WIFI
+
+  const wifi = document.getElementById("wifi");
+
+  if (data.hotspot) {
+
+    wifi.textContent = "● Connecté";
+    wifi.className = "wifi";
+
+    setTag("wifiStatus", "Actif", "green");
+
+  } else {
+
+    wifi.textContent = "● Déconnecté";
+    wifi.className = "wifi off";
+
+    setTag("wifiStatus", "Inactif", "red");
+  }
+
+  // TEMPERATURE
+
+  if (data.temperatureOK) {
+
+    setText("temperature", data.temperature.toFixed(1));
+
+    setTag("temperatureStatus", "Capteur OK", "green");
+    setTag("dsStatus", "OK", "green");
+
+  } else {
+
+    setText("temperature", "--.-");
+
+    setTag("temperatureStatus", "Défaut", "red");
+    setTag("dsStatus", "Défaut", "red");
+  }
+
+  // MQ2
+
+  setText("mq2", data.mq2);
+  setText("threshold", data.threshold > 0 ? data.threshold : "---");
+
+  if (data.mqFault) {
+
+    setText("smokeText", "Indisponible");
+
+    setTag("smokeStatus", "Défaut capteur", "red");
+    setTag("mqStatus", "Défaut", "red");
+
+  } else {
+
+    setTag("mqStatus", "OK", "green");
+
+    if (data.stateCode === 4 && data.threshold > 0) {
+
+      if (data.smokeAlert) {
+
+        setText("smokeText", "Insuffisante");
+
+        setTag("smokeStatus", "Manque de fumée", "red");
+
+      } else {
+
+        setText("smokeText", "Suffisante");
+
+        setTag("smokeStatus", "Niveau correct", "green");
+      }
+
+    } else {
+
+      setText("smokeText", "En attente");
+
+      setTag("smokeStatus", "Non surveillée", "orange");
+    }
+  }
+
+  // JAUGE DE FUMEE
+
+  setText("variation", data.variation.toFixed(1));
+
+  let bar = document.getElementById("smokeBar");
+
+  let percentage = 0;
+
+  if (data.threshold > 0) {
+
+    percentage = Math.min(
+      100,
+      Math.max(0, (data.mq2 / (data.threshold * 1.5)) * 100)
+    );
+  }
+
+  bar.style.width = percentage + "%";
+
+  if (data.smokeAlert) {
+
+    bar.className = "progress-bar red";
+    setText("smokeConclusion", "Sous le seuil");
+
+  } else if (data.stateCode === 4 && !data.mqFault) {
+
+    bar.className = "progress-bar";
+    setText("smokeConclusion", "Au-dessus du seuil");
+
+  } else {
+
+    bar.className = "progress-bar orange";
+    setText("smokeConclusion", "En attente");
+  }
+
+  // ETAT GENERAL
+
+  const main = document.getElementById("mainStatus");
+
+  main.className = "card main-status";
+
+  let title = "";
+  let description = "";
+
+  if (data.stateCode === 0) {
+
+    title = "Conditionnement initial";
+    description = "Le capteur effectue son conditionnement. La surveillance sera disponible à son terme.";
+    main.classList.add("wait");
+
+  } else if (data.stateCode === 1) {
+
+    title = "Calibration nécessaire";
+    description = "Le conditionnement est terminé. Lance une calibration avec une fumée satisfaisante.";
+    main.classList.add("wait");
+
+  } else if (data.stateCode === 2) {
+
+    title = "Stabilisation du capteur";
+    description = "Le capteur se stabilise avant l'acquisition des mesures.";
+    main.classList.add("wait");
+
+  } else if (data.stateCode === 3) {
+
+    title = "Calibration en cours";
+    description = "Acquisition des mesures du capteur MQ-2.";
+    main.classList.add("wait");
+
+  } else if (data.stateCode === 4) {
+
+    if (data.sensorFault) {
+
+      title = "Défaut détecté";
+      description = "Un capteur nécessite une vérification.";
+      main.classList.add("alert");
+
+    } else if (data.smokeAlert) {
+
+      title = "Manque de fumée";
+      description = "Le niveau de fumée est passé sous le seuil minimum.";
+      main.classList.add("alert");
+
+    } else {
+
+      title = "Surveillance active";
+      description = "Le système fonctionne normalement. Le niveau de fumée est suffisant.";
+    }
+  }
+
+  if (!data.hotspot) {
+
+    description += " Attention : le point d'accès Wi-Fi est indisponible.";
+    main.classList.add("alert");
+  }
+
+  if (data.sensorFault && data.stateCode !== 4) {
+
+    description += " Un défaut capteur est également détecté.";
+  }
+
+  setText("statusTitle", title);
+  setText("statusDescription", description);
+
+  // CONDITIONNEMENT
+
+  const preheatCard = document.getElementById("preheatCard");
+
+  if (data.stateCode === 0) {
+
+    preheatCard.classList.remove("hidden");
+
+    let progress =
+      (data.preheatElapsed / data.preheatTotal) * 100;
+
+    progress = Math.min(100, progress);
+
+    setText("preheatProgress", progress.toFixed(1) + " %");
+
+    setText(
+      "preheatRemaining",
+      "Temps restant : " + formatDuration(data.preheatRemaining)
+    );
+
+    document.getElementById("preheatBar").style.width =
+      progress + "%";
+
+  } else {
+
+    preheatCard.classList.add("hidden");
+  }
+
+  // CALIBRATION
+
+  const calibrationCard =
+    document.getElementById("calibrationCard");
+
+  const calibrationButton =
+    document.getElementById("calibrationButton");
+
+  const calibrationDescription =
+    document.getElementById("calibrationDescription");
+
+  const calibrationProgressContainer =
+    document.getElementById("calibrationProgressContainer");
+
+  if (data.stateCode === 1 ||
+      data.stateCode === 2 ||
+      data.stateCode === 3 ||
+      data.stateCode === 4) {
+
+    calibrationCard.classList.remove("hidden");
+
+  } else {
+
+    calibrationCard.classList.add("hidden");
+  }
+
+  if (data.stateCode === 1) {
+
+    calibrationButton.disabled = false;
+    calibrationButton.textContent = "Lancer la calibration";
+
+    calibrationDescription.textContent =
+      "Place le fumoir dans ses conditions normales de fonctionnement, avec une fumée satisfaisante.";
+
+    calibrationProgressContainer.classList.add("hidden");
+
+  } else if (data.stateCode === 2) {
+
+    calibrationButton.disabled = true;
+    calibrationButton.textContent = "Stabilisation en cours...";
+
+    calibrationDescription.textContent =
+      "Le capteur se stabilise pendant 5 minutes avant les mesures.";
+
+    calibrationProgressContainer.classList.add("hidden");
+
+  } else if (data.stateCode === 3) {
+
+    calibrationButton.disabled = true;
+    calibrationButton.textContent = "Calibration en cours...";
+
+    calibrationDescription.textContent =
+      "Acquisition automatique des mesures.";
+
+    calibrationProgressContainer.classList.remove("hidden");
+
+    let progress =
+      (data.calibrationCount / 100) * 100;
+
+    setText(
+      "calibrationProgress",
+      data.calibrationCount + " / 100"
+    );
+
+    setText(
+      "calibrationPercent",
+      progress.toFixed(0) + " %"
+    );
+
+    document.getElementById("calibrationBar").style.width =
+      progress + "%";
+
+  } else if (data.stateCode === 4) {
+
+    calibrationButton.disabled = false;
+    calibrationButton.textContent = "Recalibrer le capteur";
+
+    calibrationDescription.textContent =
+      "Tu peux lancer une nouvelle calibration si les conditions de fumage ont changé.";
+
+    calibrationProgressContainer.classList.add("hidden");
+
+  } else {
+
+    calibrationCard.classList.add("hidden");
+  }
+
+  // DETAILS TECHNIQUES
+
+  setText("technicalState", data.state);
+  setText("technicalMQ2", data.mq2);
+  setText("technicalThreshold", data.threshold);
+
+  setText(
+    "technicalAverage",
+    data.calibrationAverage.toFixed(1)
+  );
+
+  setText(
+    "technicalSamples",
+    data.calibrationCount + " / 100"
+  );
+
+  setText("lastUpdate", "Dernière actualisation : maintenant");
+}
+
+async function refreshData() {
 
   try {
 
-    const response = await fetch('/data');
-    const d = await response.json();
+    const response = await fetch("/data", {
+      cache: "no-store"
+    });
 
-    document.getElementById('state').textContent = d.state;
-
-    document.getElementById('wifi').textContent =
-      'Hotspot : ' + (d.hotspot ? 'ACTIF' : 'INACTIF');
-
-    document.getElementById('temperature').textContent =
-      d.temperatureOK
-        ? d.temperature.toFixed(2) + ' °C'
-        : 'ERREUR';
-
-    document.getElementById('temperatureStatus').textContent =
-      d.temperatureOK ? 'Capteur OK' : 'Capteur non detecte';
-
-    document.getElementById('mq2').textContent = d.mq2;
-
-    document.getElementById('threshold').textContent =
-      d.threshold > 0 ? d.threshold : 'Non defini';
-
-    document.getElementById('variation').textContent =
-      d.variation.toFixed(2);
-
-    let smokeStatus = document.getElementById('smokeStatus');
-
-    if (d.stateCode !== 4) {
-
-      smokeStatus.textContent = 'Surveillance inactive';
-      smokeStatus.className = 'status warning';
-
-    } else if (d.smokeAlert) {
-
-      smokeStatus.textContent = 'MANQUE DE FUMEE';
-      smokeStatus.className = 'status alert';
-
-    } else {
-
-      smokeStatus.textContent = 'FUMEE SUFFISANTE';
-      smokeStatus.className = 'status ok';
-
+    if (!response.ok) {
+      throw new Error("Erreur serveur");
     }
 
-    document.getElementById('remaining').textContent =
-      formatDuration(d.preheatRemaining);
+    const data = await response.json();
 
-    document.getElementById('elapsed').textContent =
-      'Ecoule : ' + formatDuration(d.preheatElapsed);
+    updateDashboard(data);
 
-    let percent =
-      Math.min(100, d.preheatElapsed / d.preheatTotal * 100);
+  } catch (error) {
 
-    document.getElementById('progress').style.width =
-      percent + '%';
+    setText("statusTitle", "Connexion interrompue");
 
-    document.getElementById('dsStatus').textContent =
-      d.temperatureOK ? 'OK' : 'DEFAUT';
+    setText(
+      "statusDescription",
+      "Impossible de communiquer avec le fumoir."
+    );
 
-    document.getElementById('mqStatus').textContent =
-      d.mqFault ? 'DEFAUT' : 'OK';
+    document.getElementById("mainStatus").className =
+      "card main-status alert";
 
-    const canCalibrate =
-      d.stateCode === 1 || d.stateCode === 4;
-
-    document.getElementById('calibrate').disabled =
-      !canCalibrate;
-
-    let info = '';
-
-    if (d.stateCode === 0) {
-      info = 'Conditionnement initial en cours';
-    } else if (d.stateCode === 1) {
-      info = 'Pret : demarrer le fumoir avec une fumee satisfaisante';
-    } else if (d.stateCode === 2) {
-      info = 'Stabilisation du capteur en cours (5 minutes)';
-    } else if (d.stateCode === 3) {
-      info = 'Acquisition : ' + d.calibrationCount + '/100 mesures';
-    } else {
-      info = 'Seuil minimal enregistre : ' + d.threshold;
-    }
-
-    document.getElementById('calibrationInfo').textContent = info;
-
-  } catch (e) {
-
-    document.getElementById('state').textContent =
-      'Connexion perdue';
-
+    document.getElementById("wifi").textContent =
+      "● Hors ligne";
   }
-
 }
 
-async function calibrate() {
+async function startCalibration() {
 
-  const confirmation = confirm(
-    'Le fumoir produit-il actuellement une quantite de fumee satisfaisante ?'
-  );
-
-  if (!confirmation) {
+  if (!confirm(
+    "Le fumoir produit-il actuellement une fumée satisfaisante ?"
+  )) {
     return;
   }
 
-  await fetch('/calibrate', { method: 'POST' });
+  try {
 
-  refresh();
+    const response = await fetch("/calibrate", {
+      method: "POST"
+    });
 
+    const result = await response.text();
+
+    alert(result);
+
+    refreshData();
+
+  } catch (error) {
+
+    alert("Impossible de lancer la calibration.");
+  }
 }
 
-setInterval(refresh, 2000);
-refresh();
+refreshData();
+
+setInterval(refreshData, 1000);
 
 </script>
 
@@ -1069,181 +1710,245 @@ refresh();
 </html>
 )rawliteral";
 
-// =====================================================
-// DONNEES JSON
-// =====================================================
+// ============================================================
+// SERVEUR WEB
+// ============================================================
+
+void handleRoot() {
+
+  server.send_P(
+    200,
+    "text/html; charset=utf-8",
+    MAIN_PAGE
+  );
+}
 
 void handleData() {
 
-  uint64_t remaining = 0;
-
-  if (systemState == INITIAL_PREHEAT &&
-      preheatElapsed < INITIAL_PREHEAT_MS) {
-
-    remaining = INITIAL_PREHEAT_MS - preheatElapsed;
-
-  }
-
   String json = "{";
 
-  json += "\"state\":\"" + getStateName() + "\",";
-  json += "\"stateCode\":" + String((int)systemState) + ",";
+  json += "\"state\":\"";
+  json += getStateName();
+  json += "\",";
+
+  json += "\"stateCode\":";
+  json += String(getStateCode());
+  json += ",";
 
   json += "\"hotspot\":";
-  json += hotspotOK ? "true," : "false,";
+  json += hotspotActive ? "true" : "false";
+  json += ",";
 
   json += "\"temperatureOK\":";
-  json += temperatureOK ? "true," : "false,";
+  json += temperatureOK ? "true" : "false";
+  json += ",";
 
   json += "\"temperature\":";
-  json += String(temperatureOK ? temperatureC : 0.0, 2) + ",";
+  json += temperatureOK ? String(temperature, 2) : "0";
+  json += ",";
 
-  json += "\"mq2\":" + String(mq2Raw) + ",";
-  json += "\"threshold\":" + String(smokeThreshold) + ",";
-  json += "\"variation\":" + String(smokeVariation, 2) + ",";
+  json += "\"mq2\":";
+  json += String(mq2Raw);
+  json += ",";
+
+  json += "\"threshold\":";
+  json += String(smokeThreshold);
+  json += ",";
+
+  json += "\"variation\":";
+  json += String(smokeVariation, 2);
+  json += ",";
 
   json += "\"smokeAlert\":";
-  json += smokeAlert ? "true," : "false,";
+  json += smokeAlert ? "true" : "false";
+  json += ",";
 
   json += "\"mqFault\":";
-  json += mq2SensorFault ? "true," : "false,";
+  json += mq2SensorFault ? "true" : "false";
+  json += ",";
 
-  json += "\"calibrationCount\":" + String(calibrationCount) + ",";
+  json += "\"sensorFault\":";
+  json += hasSensorFault() ? "true" : "false";
+  json += ",";
+
+  json += "\"calibrationCount\":";
+  json += String(calibrationCount);
+  json += ",";
+
+  json += "\"calibrationAverage\":";
+  json += String(calibrationAverage, 2);
+  json += ",";
 
   json += "\"preheatElapsed\":";
-  json += String((unsigned long)preheatElapsed) + ",";
+  json += String((unsigned long)preheatElapsed);
+  json += ",";
 
   json += "\"preheatRemaining\":";
-  json += String((unsigned long)remaining) + ",";
+  json += String((unsigned long)getPreheatRemaining());
+  json += ",";
 
   json += "\"preheatTotal\":";
   json += String((unsigned long)INITIAL_PREHEAT_MS);
 
   json += "}";
 
-  server.send(200, "application/json", json);
-
+  server.send(
+    200,
+    "application/json",
+    json
+  );
 }
 
-// =====================================================
-// ROUTE CALIBRATION
-// =====================================================
+void handleCalibration() {
 
-void handleCalibrate() {
+  if (!isCalibrationPossible()) {
 
-  if (systemState == WAIT_CALIBRATION ||
-      systemState == MONITORING) {
+    server.send(
+      409,
+      "text/plain",
+      "Calibration impossible dans cet etat."
+    );
 
-    startCalibration();
-
-    server.send(200, "text/plain", "Calibration demarree");
-
-  } else {
-
-    server.send(409, "text/plain", "Calibration impossible");
-
+    return;
   }
 
+  startCalibration();
+
+  server.send(
+    200,
+    "text/plain",
+    "Calibration demarree. Stabilisation de 5 minutes."
+  );
 }
 
-// =====================================================
+void configureWebServer() {
+
+  server.on("/", HTTP_GET, handleRoot);
+
+  server.on("/data", HTTP_GET, handleData);
+
+  server.on(
+    "/calibrate",
+    HTTP_POST,
+    handleCalibration
+  );
+
+  server.onNotFound([]() {
+
+    server.send(
+      404,
+      "text/plain",
+      "Page introuvable"
+    );
+  });
+
+  server.begin();
+
+  Serial.println("[WEB] Serveur HTTP demarre");
+}
+
+// ============================================================
 // SETUP
-// =====================================================
+// ============================================================
 
 void setup() {
 
   Serial.begin(115200);
-  delay(200);
+  delay(100);
 
   Serial.println();
-  Serial.println("========================================");
-  Serial.println("          DEMARRAGE DU FUMOIR");
-  Serial.println("========================================");
+  Serial.println("================================");
+  Serial.println("       FUMOIR COLD");
+  Serial.println("       NODEMCU ESP8266");
+  Serial.println("================================");
 
-  // Initialisation des LED
-  pinMode(LED_SYSTEM_STATUS, OUTPUT);
-  pinMode(LED_CALIBRATION_STATUS, OUTPUT);
-  pinMode(LED_SMOKE_ALERT, OUTPUT);
-  pinMode(LED_SENSOR_FAULT, OUTPUT);
+  // LEDs
+  pinMode(PIN_LED_SYSTEM, OUTPUT);
+  pinMode(PIN_LED_CALIB, OUTPUT);
+  pinMode(PIN_LED_SMOKE, OUTPUT);
+  pinMode(PIN_LED_FAULT, OUTPUT);
 
-  digitalWrite(LED_SYSTEM_STATUS, LED_OFF);
-  digitalWrite(LED_CALIBRATION_STATUS, LED_OFF);
-  digitalWrite(LED_SMOKE_ALERT, LED_OFF);
-  digitalWrite(LED_SENSOR_FAULT, LED_OFF);
+  digitalWrite(PIN_LED_SYSTEM, LED_OFF);
+  digitalWrite(PIN_LED_CALIB, LED_OFF);
+  digitalWrite(PIN_LED_SMOKE, LED_OFF);
+  digitalWrite(PIN_LED_FAULT, LED_OFF);
 
-  // Initialisation EEPROM
-  EEPROM.begin(EEPROM_SIZE);
-  loadEEPROM();
-
-  // Initialisation DS18B20
+  // DS18B20
   ds18b20.begin();
-  ds18b20.setResolution(12);
+
+  // Conversion asynchrone
   ds18b20.setWaitForConversion(false);
 
-  // Demarrage hotspot
-  WiFi.mode(WIFI_AP);
-  hotspotOK = WiFi.softAP(AP_SSID, AP_PASSWORD);
-
-  // Routes serveur web
-  server.on("/", HTTP_GET, []() {
-    server.send_P(200, "text/html", MAIN_PAGE);
-  });
-
-  server.on("/data", HTTP_GET, handleData);
-  server.on("/calibrate", HTTP_POST, handleCalibrate);
-
-  server.begin();
+  // EEPROM
+  loadEEPROM();
 
   // Initialisation des temporisations
-  lastPreheatUpdate = millis();
-  lastEEPROMsave = millis();
+  unsigned long now = millis();
 
-  lastTempRefresh = millis() - TEMP_REFRESH_MS;
-  lastMQ2Refresh = 0;
+  lastPreheatUpdate = now;
+  lastEEPROMSave = now;
 
-  Serial.print("Hotspot : ");
-  Serial.println(hotspotOK ? "ACTIF" : "ERREUR");
+  lastTemperatureRequest = now - DS18B20_INTERVAL_MS;
+  lastMQ2Read = now - MQ2_INTERVAL_MS;
 
-  Serial.print("Adresse IP : ");
-  Serial.println(WiFi.softAPIP());
+  // Wi-Fi
+  startHotspot();
 
-  Serial.print("SSID : ");
-  Serial.println(AP_SSID);
+  // Serveur web
+  configureWebServer();
 
-  Serial.print("Etat initial : ");
+  // Premiere demande de temperature
+  ds18b20.requestTemperatures();
+
+  lastTemperatureRequest = millis();
+  temperatureRequestTime = millis();
+  dsConversionPending = true;
+
+  Serial.println();
+  Serial.println("[SYSTEME] Initialisation terminee");
+  Serial.print("[SYSTEME] Etat : ");
   Serial.println(getStateName());
 
-  if (smokeThreshold > 0) {
-    Serial.print("Seuil minimal sauvegarde : ");
-    Serial.println(smokeThreshold);
-  }
+  Serial.print("[SYSTEME] Interface web : http://");
+  Serial.println(WiFi.softAPIP());
 
-  Serial.println("Serveur web demarre.");
-
+  Serial.println("================================");
 }
 
-// =====================================================
+// ============================================================
 // LOOP
-// =====================================================
+// ============================================================
 
 void loop() {
 
+  // Serveur web
   server.handleClient();
 
+  // Connexion Wi-Fi
   updateHotspot();
 
+  // Lecture des capteurs
   updateTemperature();
-
   updateMQ2();
 
+  // Gestion du conditionnement
   updatePreheat();
 
+  // Gestion de la calibration
   updateCalibration();
 
-  updateStatusLeds();
+  // Gestion des LEDs
+  updateLEDs();
 
+  // Moniteur serie
   printSerialStatus();
 
-  yield();
+  // Sauvegarde periodique EEPROM
+  if (systemState == INITIAL_PREHEAT &&
+      millis() - lastEEPROMSave >= EEPROM_SAVE_INTERVAL_MS) {
 
+    saveEEPROM();
+  }
+
+  yield();
 }
