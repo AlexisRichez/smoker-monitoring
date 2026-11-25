@@ -4,6 +4,8 @@ A Wi-Fi-enabled monitoring system for cold smoking, based on an ESP8266 NodeMCU,
 
 The system continuously monitors the smoker temperature and smoke level, detects insufficient smoke and provides a responsive web dashboard accessible from a smartphone or computer.
 
+A permanent Wi-Fi configuration access point allows users to configure or update their home Wi-Fi credentials directly from a web page, without uploading new firmware.
+
 ## Features
 
 - 🌡️ **Temperature monitoring** using a DS18B20 digital sensor.
@@ -11,9 +13,11 @@ The system continuously monitors the smoker temperature and smoke level, detects
 - 📉 **Minimum smoke threshold** detection to identify insufficient smoke.
 - ⏱️ **Initial sensor conditioning** with a non-blocking 24-hour period.
 - 🎯 **Manual calibration** based on the smoke level under normal operating conditions.
-- 📶 **Standalone Wi-Fi access point** — no router or Internet connection required.
+- 📶 **Permanent Wi-Fi access point** for configuration and local access.
+- 🏠 **Home Wi-Fi connectivity** configurable through a web interface.
+- 🔄 **Wi-Fi credential management** without uploading new firmware.
 - 🌐 **Responsive web dashboard** for real-time monitoring.
-- 💾 **EEPROM persistence** for the conditioning progress and calibrated smoke threshold.
+- 💾 **EEPROM persistence** for conditioning progress, calibrated smoke threshold and Wi-Fi credentials.
 - 🚦 **Status LEDs** for system operation, calibration, smoke alerts and sensor faults.
 - 🖥️ **Serial monitoring** for debugging and sensor diagnostics.
 
@@ -77,10 +81,12 @@ The LED logic can be inverted in the source code if the hardware uses active LOW
 When the system starts for the first time, the MQ-2 sensor enters an initial conditioning period of 24 hours.
 
 This process is non-blocking:
+
 - The Wi-Fi access point remains available.
 - The DS18B20 continues measuring temperature.
 - The MQ-2 continues being read.
 - Conditioning progress is periodically saved to EEPROM.
+- The home Wi-Fi connection can be configured while conditioning is in progress.
 
 After the conditioning period, manual calibration becomes available.
 
@@ -124,17 +130,52 @@ The DS18B20 provides continuous temperature measurements.
 
 A sensor fault is reported if the temperature reading is invalid or the sensor becomes disconnected.
 
-## Web dashboard
+## Wi-Fi configuration and web dashboard
 
-The system creates its own Wi-Fi access point.
+The ESP8266 operates in access point + station mode (`WIFI_AP_STA`).
+
+It maintains its own Wi-Fi access point permanently, even when connected to the home Wi-Fi network.
+
+This provides two ways to access the system:
+
+- **Configuration access point:** always available, independently of the home router.
+- **Home Wi-Fi:** allows access to the dashboard through the local network.
+
+### Configuration access point
 
 | Setting | Value |
 |---|---|
-| SSID | `FUMOIR_COLD` |
+| SSID | `FUMOIR_CONFIG` |
 | Password | `Fumage2026` |
+| Configuration URL | `http://192.168.4.1/wifi` |
 | Dashboard URL | `http://192.168.4.1` |
 
-Connect a smartphone, tablet or computer to the access point and open the dashboard in a web browser.
+Connect a smartphone, tablet or computer to the `FUMOIR_CONFIG` network and open the configuration page.
+
+### Configuring the home Wi-Fi network
+
+1. Connect to the `FUMOIR_CONFIG` access point.
+2. Open `http://192.168.4.1/wifi` in a browser.
+3. Enter your home Wi-Fi network name (SSID).
+4. Enter your home Wi-Fi password.
+5. Submit the form.
+
+The ESP8266 saves the credentials in EEPROM and attempts to connect to the home Wi-Fi network.
+
+**No firmware upload or restart is required.** The monitoring and conditioning processes continue running during Wi-Fi configuration.
+
+The configuration access point remains active after connecting to the home network. This means that the Wi-Fi credentials can be changed at any time using the same procedure.
+
+### Accessing the dashboard
+
+The dashboard is available through either connection:
+
+| Connection | URL |
+|---|---|
+| Configuration access point | `http://192.168.4.1` |
+| Home Wi-Fi network | `http://fumoir.local` or the ESP8266 IP address assigned by the router |
+
+The `fumoir.local` address requires mDNS support on the client device and a functioning local network.
 
 The dashboard provides:
 
@@ -146,6 +187,7 @@ The dashboard provides:
 - Calibration controls and progress.
 - Sensor and Wi-Fi status.
 - Technical measurements.
+- A link to the Wi-Fi configuration page.
 
 The interface refreshes automatically without requiring a page reload.
 
@@ -166,8 +208,8 @@ The following libraries are included with the ESP8266 Arduino Core:
 
 - ESP8266WiFi
 - ESP8266WebServer
-
-EEPROM support is also provided by the ESP8266 Arduino Core.
+- ESP8266mDNS
+- EEPROM
 
 ### Uploading the firmware
 
@@ -180,34 +222,52 @@ EEPROM support is also provided by the ESP8266 Arduino Core.
 
 ### First startup
 
-1. Connect to the `FUMOIR_COLD` Wi-Fi network.
-2. Open `http://192.168.4.1`.
-3. Allow the initial 24-hour conditioning period to complete.
-4. Start the smoker under normal operating conditions.
-5. Launch the manual calibration from the dashboard.
-6. Wait for stabilization and acquisition to finish.
-7. The system automatically enters monitoring mode.
+1. Power on the NodeMCU.
+2. Connect a smartphone or computer to the `FUMOIR_CONFIG` Wi-Fi network.
+3. Open `http://192.168.4.1/wifi`.
+4. Enter your home Wi-Fi credentials and save them.
+5. The ESP8266 attempts to connect to the configured network.
+6. Access the dashboard through `http://192.168.4.1` or, when connected to the home network, `http://fumoir.local` if mDNS is supported.
+7. Allow the initial 24-hour conditioning period to complete.
+8. Start the smoker under normal operating conditions.
+9. Launch the manual calibration from the dashboard.
+10. Wait for stabilization and acquisition to finish.
+11. The system automatically enters monitoring mode.
+
+The configuration access point remains available throughout the entire process, including after the home Wi-Fi connection is established.
 
 ## EEPROM persistence
 
 The firmware stores the following information:
 
+**Smoker monitoring data:**
+
 - Initial conditioning progress.
 - Calibrated minimum smoke threshold.
 - Conditioning completion status.
+
+**Wi-Fi configuration:**
+
+- Home Wi-Fi SSID.
+- Home Wi-Fi password.
 
 The conditioning progress is saved every 5 minutes.
 
 Consequently, a sudden power loss can result in losing up to approximately 5 minutes of conditioning progress.
 
-The EEPROM data format is identified by a magic value. Changing the stored data structure or its magic value may require a fresh initialization.
+Wi-Fi credentials are saved when the configuration form is submitted. They remain available after a power cycle, so there is no need to configure the network again.
+
+The EEPROM data format uses magic values to identify valid stored data. Changing the stored data structures or their magic values may require a fresh initialization.
+
+**Security note:** Wi-Fi credentials are stored in the ESP8266 EEPROM emulation and are not encrypted by the application. Anyone with physical access to the device and the ability to read its flash memory may be able to retrieve them. Use a strong password for the configuration access point.
 
 ## Serial diagnostics
 
 The Serial Monitor provides regular diagnostic information, including:
 
 - Current system state.
-- Wi-Fi access point status.
+- Configuration access point status.
+- Home Wi-Fi connection status.
 - DS18B20 temperature.
 - Raw MQ-2 ADC value.
 - Calibrated minimum threshold.
@@ -220,7 +280,7 @@ Baud rate: **115200**
 
 ## Configuration
 
-The main parameters can be modified directly in the firmware.
+The main operating parameters can be modified directly in the firmware.
 
 ```cpp
 // Initial conditioning period
@@ -237,12 +297,16 @@ const int CALIBRATION_SAMPLES = 100;
 const float MIN_SMOKE_MARGIN_PERCENT = 15.0;
 ```
 
-The Wi-Fi credentials can also be changed:
+The configuration access point credentials are defined in the firmware:
 
 ```cpp
-const char* WIFI_SSID = "FUMOIR_COLD";
-const char* WIFI_PASSWORD = "Fumage2026";
+const char* AP_SSID = "FUMOIR_CONFIG";
+const char* AP_PASSWORD = "Fumage2026";
 ```
+
+These credentials are independent of the home Wi-Fi credentials.
+
+Home Wi-Fi credentials are no longer hardcoded in the firmware. They are entered through the web configuration page and stored in EEPROM.
 
 ## Limitations and safety considerations
 
@@ -252,11 +316,13 @@ const char* WIFI_PASSWORD = "Fumage2026";
 - The 24-hour conditioning period is a configurable initial operating parameter; follow the requirements of the actual sensor manufacturer.
 - The MQ-2 must not be used as a fire, carbon monoxide or life-safety detector.
 - The dashboard is intended for monitoring and does not replace physical supervision of the smoker.
-- The default Wi-Fi password should be changed before deployment.
+- The configuration access point uses a default password. Change it in the firmware before deployment.
+- Wi-Fi connectivity is not required for the local monitoring logic to continue operating.
+- The configuration access point remains available even if the home router is offline.
 
 ## Project status
 
-The project is based on an ESP8266 firmware implementation with a browser-based monitoring interface.
+The project is based on an ESP8266 firmware implementation with a browser-based monitoring interface and a persistent Wi-Fi configuration portal.
 
 Hardware validation, calibration behavior and sensor response should be tested with the actual smoker setup before relying on the alerts.
 
