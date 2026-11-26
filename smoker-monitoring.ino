@@ -1812,7 +1812,7 @@ void setup() {
 
   Serial.println("[WIFI] Configuration : http://192.168.4.1/wifi");
   Serial.println("[WIFI] Tableau de bord : http://192.168.4.1");
-  Serial.println("[WIFI] Adresse domestique : http://fumoir.local");
+  Serial.println("[WIFI] Adresse domestique : http://smoker.local");
 
   Serial.println("================================");
 }
