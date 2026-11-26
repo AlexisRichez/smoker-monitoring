@@ -13,11 +13,11 @@
 // ============================================================
 
 // Hotspot permanent de configuration
-const char* AP_SSID = "FUMOIR_SECOURS";
-const char* AP_PASSWORD = "Fumage2026";
+const char* AP_SSID = "HOTSPOT_SMOKER";
+const char* AP_PASSWORD = "Smoker2026";
 
 // Adresse mDNS
-const char* MDNS_HOSTNAME = "fumoir";
+const char* MDNS_HOSTNAME = "smoker";
 
 // Temporisations Wi-Fi
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000UL;
